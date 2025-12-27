@@ -15,6 +15,11 @@
     (String. ^bytes x)
     x))
 
+(defn- remove-nils
+  "Remove nil values from a map. Bencode cannot encode nil."
+  [m]
+  (into {} (remove (fn [[_ v]] (nil? v)) m)))
+
 (defn- read-bencode [in]
   (try (let [msg (bencode/read-bencode in)
              msg (zipmap (map keyword (keys msg))
@@ -27,16 +32,21 @@
 (defonce ^:private !last-ctx
   (volatile! nil))
 
+(defonce !sessions (atom #{}))
+
 (defn send-response [{:keys [out id session response]
                       :or {out (:out @!last-ctx)}}]
   (let [response (cond-> response
                    id (assoc :id id)
-                   session (assoc :session session))]
+                   session (assoc :session session))
+        ;; Remove nil values - bencode cannot encode nil
+        response (remove-nils response)]
     (bencode/write-bencode out response)
     (.flush ^java.io.OutputStream out)))
 
 (defn- handle-clone [ctx]
   (let [id (str (java.util.UUID/randomUUID))]
+    (swap! !sessions conj id)
     (send-response (assoc ctx
                           :response {"new-session" id "status" ["done"]}))))
 
@@ -98,11 +108,23 @@
                            :eldo
                            :lookup
                            :complete
-                           :close :clone :load-file])
+                           :close :clone :load-file
+                           :ls-sessions])
                          (repeat {}))
                   "aux" {"cwd" (System/getProperty "user.dir")}
                   :status ["done"]}]
     (send-response (assoc ctx :response response))))
+
+(defn- handle-ls-sessions [ctx]
+  "Handle ls-sessions locally - don't forward to browser"
+  (send-response (assoc ctx :response {"sessions" (vec @!sessions)
+                                       "status" ["done"]})))
+
+(defn- handle-close [ctx]
+  "Handle close locally - don't forward to browser"
+  (when-let [session (:session ctx)]
+    (swap! !sessions disj session))
+  (send-response (assoc ctx :response {"status" ["done"]})))
 
 (defn- session-loop [in out {:keys [opts]}]
   (loop []
@@ -125,6 +147,8 @@
           :describe (handle-describe ctx)
           :load-file (handle-load-file ctx)
           :complete (handle-complete ctx)
+          :ls-sessions (handle-ls-sessions ctx)
+          :close (handle-close ctx)
           (generically-handle-on-server (assoc ctx :op op))))
       (recur))))
 
