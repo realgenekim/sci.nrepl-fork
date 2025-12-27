@@ -1,7 +1,7 @@
 (ns sci.nrepl.browser-server
   (:require
    [bencode.core :as bencode]
-   [clojure.edn :as edn]
+   [cheshire.core :as json]
    [clojure.string :as str]
    [org.httpkit.server :as httpkit])
   (:import
@@ -52,15 +52,39 @@
 
 (defonce nrepl-channel (atom nil))
 
+;; Atom for Babashka direct eval responses (bypasses nREPL)
+(defonce babashka-response-handler (atom nil))
+
 (defn- response-handler [message]
-  (let [{:as msg :keys [id session]} (edn/read-string message)]
-    (send-response {:id id
-                    :session session
-                    :response (dissoc msg :id :session)})))
+  (let [msg (json/parse-string message true) ;; keywordize keys
+        {:keys [id type result error]} msg]
+    ;; Check if this is a Babashka direct eval (bb-* prefix)
+    (if (and id (str/starts-with? (str id) "bb-"))
+      ;; Route to Babashka handler
+      (when-let [handler @babashka-response-handler]
+        (handler id result error))
+      ;; Route to nREPL client
+      (let [session (:session @!last-ctx)
+            response (cond
+                       (= type "result")
+                       {"value" result "status" ["done"]}
+
+                       (= type "error")
+                       {"err" error "status" ["done"]}
+
+                       :else
+                       (-> msg (dissoc :id :session :type) (assoc "status" ["done"])))]
+        (send-response {:id id
+                        :session session
+                        :response response})))))
 
 (defn- websocket-send! [msg]
   (when-let [chan @nrepl-channel]
-    (httpkit/send! chan (str msg))))
+    ;; Convert :op to :type for Chrome sandbox compatibility
+    (let [msg (if (:op msg)
+                (-> msg (assoc :type (name (:op msg))) (dissoc :op))
+                msg)]
+      (httpkit/send! chan (json/generate-string msg)))))
 
 (defn- handle-eval [{:as ctx :keys [msg session id send-fn] :or {send-fn websocket-send!}}]
   (vreset! !last-ctx ctx)
